@@ -1,17 +1,19 @@
 #pragma once
 
 #include <control_plane.h>
+#include <rate_limiter.h>
 
 #include <boost/asio/ip/address.hpp>
 
 #include <cstdint>
 #include <vector>
+#include <iostream>
 
 class data_plane {
 public:
     using Packet = std::vector<uint8_t>;
 
-    explicit data_plane(control_plane &control_plane);
+    explicit data_plane(control_plane &control_plane, uint64_t uplink_bps, uint64_t downlink_bps);
     virtual ~data_plane() = default;
 
     void handle_uplink(uint32_t dp_teid, Packet &&packet);
@@ -22,4 +24,8 @@ protected:
     virtual void forward_packet_to_apn(boost::asio::ip::address_v4 apn_gateway, Packet &&packet) = 0;
 
     control_plane &_control_plane;
+    rate_limiter _uplink_bucket;
+    rate_limiter _downlink_bucket;
 };
+
+
