@@ -1,8 +1,15 @@
 #include <data_plane.h>
 
-data_plane::data_plane(control_plane &control_plane) : _control_plane(control_plane) {}
+data_plane::data_plane(control_plane &control_plane, uint64_t uplink_bps, uint64_t downlink_bps) : 
+     _control_plane(control_plane),
+        _uplink_bucket(uplink_bps, uplink_bps),
+        _downlink_bucket(downlink_bps, downlink_bps) {}
 
 void data_plane::handle_uplink(uint32_t dp_teid, Packet &&packet) {
+    if (!_uplink_bucket.allow(packet.size())) {
+        std::cerr << "Uplink limited, dropping packet\n";
+        return;
+    }
     // ищем bearer по TEID
     auto bearer = _control_plane.find_bearer_by_dp_teid(dp_teid);
     if (!bearer) return;
@@ -18,6 +25,10 @@ void data_plane::handle_uplink(uint32_t dp_teid, Packet &&packet) {
 }
 
 void data_plane::handle_downlink(const boost::asio::ip::address_v4 &ue_ip, Packet &&packet) {
+    if (!_downlink_bucket.allow(packet.size())) {
+        std::cerr << "Downlink limited, dropping packet\n";
+        return;
+    }
     // находим PDN по IP
     auto pdn = _control_plane.find_pdn_by_ip_address(ue_ip);
     if (!pdn) return;
