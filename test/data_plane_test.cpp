@@ -2,20 +2,32 @@
 
 #include <gtest/gtest.h>
 
+class Packet : public std::vector<uint8_t> {
+public:
+    using std::vector<uint8_t>::vector;  // Наследуем конструкторы
+
+    bool operator==(const Packet& other) const {
+        return static_cast<const std::vector<uint8_t>&>(*this) ==
+               static_cast<const std::vector<uint8_t>&>(other);
+    }
+};
+
 class mock_data_plane_forwarding : public data_plane {
 public:
-    explicit mock_data_plane_forwarding(control_plane &control_plane) : data_plane(control_plane) {}
+    explicit mock_data_plane_forwarding(control_plane& control_plane,
+                                        uint64_t uplink_bps = 65536,  // по умолчанию высокие лимиты - 64 Кб
+                                        uint64_t downlink_bps = 65536)
+        : data_plane(control_plane, uplink_bps, downlink_bps) {}
 
-    std::unordered_map<boost::asio::ip::address_v4, std::unordered_map<uint32_t, std::vector<Packet>>>
-            _forwarded_to_sgw;
+    std::unordered_map<boost::asio::ip::address_v4, std::unordered_map<uint32_t, std::vector<Packet>>> _forwarded_to_sgw;
     std::unordered_map<boost::asio::ip::address_v4, std::vector<Packet>> _forwarded_to_apn;
 
 protected:
-    void forward_packet_to_sgw(boost::asio::ip::address_v4 sgw_addr, uint32_t sgw_dp_teid, Packet &&packet) override {
+    void forward_packet_to_sgw(boost::asio::ip::address_v4 sgw_addr, uint32_t sgw_dp_teid, Packet&& packet) override {
         _forwarded_to_sgw[sgw_addr][sgw_dp_teid].emplace_back(std::move(packet));
     }
 
-    void forward_packet_to_apn(boost::asio::ip::address_v4 apn_gateway, Packet &&packet) override {
+    void forward_packet_to_apn(boost::asio::ip::address_v4 apn_gateway, Packet&& packet) override {
         _forwarded_to_apn[apn_gateway].emplace_back(std::move(packet));
     }
 };
@@ -94,4 +106,52 @@ TEST_F(data_plane_test, didnt_handle_downlink_for_unknown_ue_ip) {
     _data_plane.handle_downlink(boost::asio::ip::address_v4::any(), {packet1.begin(), packet1.end()});
 
     ASSERT_TRUE(_data_plane._forwarded_to_apn.empty());
+}
+
+TEST_F(data_plane_test, uplink_rate_limit_blocks) {
+    // Ограничим uplink до 3 байта/с, чтобы заблокировать после одного пакета
+    mock_data_plane_forwarding limited_plane(_control_plane, 3, 65536);
+    Packet pkt1{1, 2, 3};  // 3 байта — проходит
+    Packet pkt2{4};        // 1 байт — уже не должен пройти сразу
+
+    limited_plane.handle_uplink(_default_bearer->get_dp_teid(), {pkt1.begin(), pkt1.end()});
+    limited_plane.handle_uplink(_default_bearer->get_dp_teid(), {pkt2.begin(), pkt2.end()});
+
+    ASSERT_EQ(1, limited_plane._forwarded_to_apn[apn_gw].size());
+    ASSERT_EQ(pkt1, limited_plane._forwarded_to_apn[apn_gw][0]);
+}
+
+TEST_F(data_plane_test, downlink_rate_limit_blocks) {
+    mock_data_plane_forwarding limited_plane(_control_plane, 65536, 3); // downlink ограничен
+
+    Packet pkt1{1, 2, 3};
+    Packet pkt2{4};
+
+    // отправляем оба пакета
+    limited_plane.handle_downlink(_pdn->get_ue_ip_addr(), {pkt1.begin(), pkt1.end()});
+    limited_plane.handle_downlink(_pdn->get_ue_ip_addr(), {pkt2.begin(), pkt2.end()});
+
+    // но только первый пакет пройдёт
+    ASSERT_EQ(1, limited_plane._forwarded_to_sgw[sgw_addr][sgw_default_bearer_teid].size());
+    ASSERT_EQ(pkt1, limited_plane._forwarded_to_sgw[sgw_addr][sgw_default_bearer_teid][0]);
+}
+
+TEST_F(data_plane_test, rate_limit_allows_packet_after_token_replenish) {
+
+    mock_data_plane_forwarding limited_plane(_control_plane, 3, 3); // 3 байта/сек
+
+    Packet pkt1{1, 2, 3};
+    Packet pkt2{4};
+
+    // тратим все токены на оправку первого пакета
+    limited_plane.handle_uplink(_default_bearer->get_dp_teid(), {pkt1.begin(), pkt1.end()});
+
+    // ждём восстановления токенов
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    limited_plane.handle_uplink(_default_bearer->get_dp_teid(), {pkt2.begin(), pkt2.end()});
+
+    // видим, что оба пакета дошли
+    ASSERT_EQ(2, limited_plane._forwarded_to_apn[apn_gw].size());
+    ASSERT_EQ(pkt2, limited_plane._forwarded_to_apn[apn_gw][1]);
 }
